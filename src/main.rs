@@ -1,4 +1,6 @@
 use crossbeam::channel::unbounded;
+use crossbeam::select;
+use std::io::ErrorKind;
 use std::thread;
 
 // 此消息用于发送到与「主组件」并行运行的其他组件。
@@ -16,21 +18,65 @@ enum ResultMsg {
 fn main() {
     let (work_sender, work_receiver) = unbounded();
     let (result_sender, result_receiver) = unbounded();
+    // 添加一个新的Channel，Worker使用它来通知“并行”组件已经完成了一个工作单元
+    let (pool_result_sender, pool_result_receiver) = unbounded();
 
-    // 生成子线程用于执行另一个并行组件
+    let mut ongoing_work = 0;
+    let mut exiting = false;
+
+    // 引入线程池，开两个工作线程
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+
     let _ = thread::spawn(move || loop {
-        // 接收并处理消息，直到收到 exit 消息
-        match work_receiver.recv() {
-            Ok(WorkMsg::Work(num)) => {
-                // 执行一些工作，并且发送消息给 Result 队列
-                let _ = result_sender.send(ResultMsg::Result(num));
-            }
-            Ok(WorkMsg::Exit) => {
-                // 发送 exit 确认消息
-                let _ = result_sender.send(ResultMsg::Exited);
-                break;
-            }
-            _ => panic!("Error receiving a WorkMsg."),
+        // 使用 corssbeam 提供的 select! 宏 选择一个就绪工作
+        select! {
+            recv(work_receiver) -> msg => {
+                match msg {
+                    Ok(WorkMsg::Work(num)) => {
+                        let result_sender = result_sender.clone();
+                        let pool_result_sender = pool_result_sender.clone();
+
+                        // 注意，这里正在池上启动一个新的工作单元。
+                        ongoing_work += 1;
+
+                        pool.spawn(move || {
+                            // 1. 发送结果给「主组件」
+                            let _ = result_sender.send(ResultMsg::Result(num));
+
+                            // 2. 让并行组件知道这里完成了一个工作单元
+                            let _ = pool_result_sender.send(());
+                        });
+                    },
+                    Ok(WorkMsg::Exit) => {
+                        // 注意，这里接收请求并退出
+                        exiting = true;
+
+                        // 如果没有正则进行的工作则立即退出
+                        if ongoing_work == 0 {
+                            let _ = result_sender.send(ResultMsg::Exited);
+                            break;
+                        }
+                    },
+                    _ => panic!("Error receiving a WorkMsg."),
+                }
+            },
+            recv(pool_result_receiver) -> _ => {
+                if ongoing_work == 0 {
+                    panic!("Received an unexpected pool result.");
+                }
+
+                // 注意，一个工作单元已经被完成
+                ongoing_work -=1;
+
+                // 如果没有正在进行的工作，并且接收到了退出请求，那么就退出
+                if ongoing_work == 0 && exiting {
+                    let _ = result_sender.send(ResultMsg::Exited);
+                    break;
+                }
+            },
         }
     });
 
@@ -43,9 +89,8 @@ fn main() {
 
     loop {
         match result_receiver.recv() {
-            Ok(ResultMsg::Result(num)) => {
-                // 断言确保接收和发送的顺序是一致的
-                assert_eq!(num, counter);
+            Ok(ResultMsg::Result(_)) => {
+                // 计数当前完成的工作单元
                 counter += 1;
             }
             Ok(ResultMsg::Exited) => {
